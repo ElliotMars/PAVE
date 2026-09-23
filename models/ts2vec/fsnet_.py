@@ -1,0 +1,240 @@
+from itertools import chain
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+def normalize(W):
+    W_norm = torch.norm(W)
+    W_norm = torch.relu(W_norm - 1) + 1
+    W = W / W_norm
+    return W
+
+
+class SamePadConv(nn.Module):
+
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1, groups=1, gamma=0.9, device=None):
+        super().__init__()
+
+        self.device = device if device else torch.device('cuda:0')
+        self.receptive_field = (kernel_size - 1) * dilation + 1
+        padding = self.receptive_field // 2
+        self.conv = nn.Conv1d(
+            in_channels, out_channels, kernel_size,
+            padding=padding,
+            dilation=dilation,
+            groups=groups, bias=False
+        )
+        self.bias = torch.nn.Parameter(torch.zeros([out_channels]), requires_grad=True)
+        self.padding = padding
+        self.dilation = dilation
+        self.kernel_size = kernel_size
+
+        self.grad_dim, self.shape = [], []
+        for p in self.conv.parameters():
+            self.grad_dim.append(p.numel())
+            self.shape.append(p.size())
+        self.dim = sum(self.grad_dim)
+        self.in_channels = in_channels
+        self.out_features = out_channels
+
+        self.n_chunks = in_channels
+        self.chunk_in_d = self.dim // self.n_chunks
+        self.chunk_out_d = int(in_channels * kernel_size // self.n_chunks)
+
+        # These tensors are forecasting state and must survive checkpoints.
+        self.register_buffer('grads', torch.zeros(sum(self.grad_dim), device=self.device))
+        self.register_buffer('f_grads', torch.zeros(sum(self.grad_dim), device=self.device))
+        self.state_updates_enabled = True
+        nh = 64
+        self.controller = nn.Sequential(nn.Linear(self.chunk_in_d, nh), nn.SiLU())
+        self.calib_w = nn.Linear(nh, self.chunk_out_d)
+        self.calib_b = nn.Linear(nh, out_channels // in_channels)
+        self.calib_f = nn.Linear(nh, out_channels // in_channels)
+        dim = self.n_chunks * (self.chunk_out_d + 2 * out_channels // in_channels)
+        self.W = nn.Parameter(torch.empty(dim, 32), requires_grad=False)
+        nn.init.xavier_uniform_(self.W.data)
+        self.W.data = normalize(self.W.data)
+        self.register_buffer('q_ema', torch.zeros(dim, device=self.device))
+        self.register_buffer('trigger', torch.zeros((), dtype=torch.bool, device=self.device))
+
+        # self.calib_w = torch.nn.Parameter(torch.ones(out_channels, in_channels,1), requires_grad = True)
+        # self.calib_b = torch.nn.Parameter(torch.zeros([out_channels]), requires_grad = True)
+        # self.calib_f = torch.nn.Parameter(torch.ones(1,out_channels,1), requires_grad = True)
+
+        # 确定是否需要移除最后一个像素
+        self.remove = 1 if self.receptive_field % 2 == 0 else 0
+        self.gamma = gamma
+        self.f_gamma = 0.3
+        self.cos = nn.CosineSimilarity(dim=0, eps=1e-6)
+        self.tau = 0.75
+
+    def ctrl_params(self):
+
+        c_iter = chain(self.controller.parameters(), self.calib_w.parameters(),
+                       self.calib_b.parameters(), self.calib_f.parameters())
+        for p in c_iter:
+            yield p
+
+    def store_grad(self):
+
+        # 实现梯度存储逻辑
+        if self.conv.weight.grad is None:
+            return
+        grad = self.conv.weight.grad.detach().clone()
+        grad = nn.functional.normalize(grad)
+        grad = grad.view(-1)
+        with torch.no_grad():
+            self.f_grads.mul_(self.f_gamma).add_(grad, alpha=1 - self.f_gamma)
+            self.grads.mul_(self.gamma).add_(grad, alpha=1 - self.gamma)
+            if not self.training:
+                e = self.cos(self.f_grads, self.grads)
+                if e < -self.tau:
+                    self.trigger.fill_(True)
+
+    def fw_chunks(self):
+
+        # 实现前向传播的块处理逻辑
+        x = self.grads.view(self.n_chunks, -1)
+        rep = self.controller(x)
+        w = self.calib_w(rep)
+        b = self.calib_b(rep)
+        f = self.calib_f(rep)
+        q = torch.cat([w.view(-1), b.view(-1), f.view(-1)])
+        if self.state_updates_enabled:
+            # Replay/reference forwards must not advance this persistent state,
+            # and the EMA must never retain a graph from an earlier batch.
+            with torch.no_grad():
+                self.q_ema.mul_(self.f_gamma).add_(q.detach(), alpha=1 - self.f_gamma)
+        q_state = self.q_ema.detach()
+        if bool(self.trigger.item()) and self.state_updates_enabled:
+            dim = w.size(0)
+            self.trigger.fill_(False)
+            # read
+
+            att = q_state @ self.W
+            att = F.softmax(att / 0.5, dim=0)
+
+            v, idx = torch.topk(att, 2)
+            ww = torch.index_select(self.W, 1, idx)
+            old_w = ww @ v.clone().detach().unsqueeze(1).float()
+            # write memory
+            s_att = torch.zeros(att.size(0)).to(self.device)
+            s_att[idx.squeeze().long()] = v.squeeze()
+            W = old_w @ s_att.unsqueeze(0)
+            mask = torch.ones(W.size()).to(self.device)
+            mask[:, idx.squeeze().long()] = self.tau
+            self.W.data = mask * self.W.data + (1 - mask) * W
+            self.W.data = normalize(self.W.data)
+            # retrieve
+            ll = torch.split(old_w, dim)
+            nw, nb, nf = w.size(1), b.size(1), f.size(1)
+            o_w, o_b, o_f = torch.cat(*[ll[:nw]]), torch.cat(*[ll[nw:nw + nb]]), torch.cat(*[ll[-nf:]])
+
+            try:
+                w = self.tau * w + (1 - self.tau) * o_w.view(w.size())
+                b = self.tau * b + (1 - self.tau) * o_b.view(b.size())
+                f = self.tau * f + (1 - self.tau) * o_f.view(f.size())
+            except (RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    "SamePadConv calibration reshape failed: "
+                    f"w_shape={tuple(w.shape)}, b_shape={tuple(b.shape)}, "
+                    f"f_shape={tuple(f.shape)}, "
+                    f"retrieved_w_shape={tuple(o_w.shape)}, "
+                    f"retrieved_b_shape={tuple(o_b.shape)}, "
+                    f"retrieved_f_shape={tuple(o_f.shape)}, "
+                    f"memory_shape={tuple(old_w.shape)}"
+                ) from exc
+        f = f.view(-1).unsqueeze(0).unsqueeze(2)
+
+        return w.unsqueeze(0), b.view(-1), f
+
+    def forward(self, x):
+
+        w, b, f = self.fw_chunks()
+
+        cw = self.conv.weight * w
+        try:
+            conv_out = F.conv1d(x, cw, padding=self.padding, dilation=self.dilation, bias=self.bias * b)
+            out = f * conv_out
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "SamePadConv calibrated forward failed: "
+                f"input_shape={tuple(x.shape)}, "
+                f"conv_weight_shape={tuple(self.conv.weight.shape)}, "
+                f"calibration_weight_shape={tuple(w.shape)}, "
+                f"calibrated_weight_shape={tuple(cw.shape)}, "
+                f"bias_shape={tuple(b.shape)}, "
+                f"feature_scale_shape={tuple(f.shape)}"
+            ) from exc
+        return out
+
+    def representation(self, x):
+
+        out = self.conv(x)
+        if self.remove > 0:
+            out = out[:, :, : -self.remove]
+        return out
+
+    def _forward(self, x):
+
+        out = self.conv(x)
+        if self.remove > 0:
+            out = out[:, :, : -self.remove]
+        return out
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, final=False, gamma=0.9, device=None):
+        super().__init__()
+        self.device = device if device else torch.device('cuda:0')
+        self.conv1 = SamePadConv(in_channels, out_channels, kernel_size, dilation=dilation, gamma=gamma,
+                                 device=self.device)
+        self.conv2 = SamePadConv(out_channels, out_channels, kernel_size, dilation=dilation, gamma=gamma,
+                                 device=self.device)
+        self.projector = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels or final else None
+
+    def ctrl_params(self):
+        c_iter = chain(self.conv1.controller.parameters(), self.conv1.calib_w.parameters(),
+                       self.conv1.calib_b.parameters(), self.conv1.calib_f.parameters(),
+                       self.conv2.controller.parameters(), self.conv2.calib_w.parameters(),
+                       self.conv2.calib_b.parameters(), self.conv2.calib_f.parameters())
+
+        return c_iter
+
+    def forward(self, x):
+        residual = x if self.projector is None else self.projector(x)
+        x = F.gelu(x)
+        x = self.conv1(x)
+        x = F.gelu(x)
+        x = self.conv2(x)
+        return x + residual
+
+
+class DilatedConvEncoder(nn.Module):
+    def __init__(self, in_channels, channels, kernel_size, gamma=0.9, device=None):
+        super().__init__()
+        self.device = device if device else torch.device('cuda:0')
+        self.net = nn.Sequential(*[
+            ConvBlock(
+                channels[i - 1] if i > 0 else in_channels,
+                channels[i],
+                kernel_size=kernel_size,
+                dilation=2 ** i,
+                final=(i == len(channels) - 1), gamma=gamma,
+                device=self.device
+            )
+            for i in range(len(channels))
+        ])
+
+    def ctrl_params(self):
+        ctrl = []
+        for l in self.net:
+            ctrl.append(l.ctrl_params())
+        c = chain(*ctrl)
+        for p in c:
+            yield p
+
+    def forward(self, x):
+        return self.net(x)

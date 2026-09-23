@@ -1,0 +1,11 @@
+# Verified with Python 3.10.20. Install the PyTorch build matching your CUDA runtime.
+torch>=2.0,<3.0
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.2
+numexpr==2.14.1
+tqdm==4.68.4
+einops==0.8.2
+pytest>=8,<10
+matplotlib>=3.7,<4
