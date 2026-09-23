@@ -1,4 +1,4 @@
-# PAVE: Online Multi-Expert Time-Series Forecasting under Concept Drift
+# PAVE: Progressive Adaptation with Version-Aware Experts for Online Time Series Forecasting
 
 PAVE is a research codebase for multivariate time-series forecasting under concept drift. It combines offline pretraining with causal online adaptation, using heterogeneous experts, dynamic routing, progressive feedback, version-aware memory, recovery replay, and subspace-based gradient protection.
 
